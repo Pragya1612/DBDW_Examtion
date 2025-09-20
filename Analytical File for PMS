@@ -1,0 +1,486 @@
+------BAckened-----
+
+# backend_pms.py
+
+import psycopg2
+import pandas as pd
+from contextlib import contextmanager
+from datetime import datetime
+
+# --- Configuration ---
+# Replace with your PostgreSQL credentials
+DB_CONFIG = {
+    "host": "localhost",
+    "database": "Performance MS",
+    "user": "postgres",
+    "password": "@Kshay123"
+}
+
+# --- Database Connection Context Manager ---
+@contextmanager
+def get_db_connection():
+    """
+    Provides a managed database connection.
+    Ensures the connection is properly closed.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        yield conn
+    except psycopg2.Error as e:
+        print(f"Database connection error: {e}")
+        # In a real app, you might use a more robust error handling mechanism
+    finally:
+        if conn:
+            conn.close()
+
+# --- Backend Class ---
+class PMSBackend:
+    """
+    Manages all database operations for the PMS.
+    """
+    def __init__(self):
+        pass
+
+    # --- CRUD Operations ---
+    
+    # READ Operations
+    def get_users_by_role(self, role):
+        """Fetches all users of a specific role."""
+        sql = "SELECT user_id, full_name FROM users WHERE role = %s ORDER BY full_name;"
+        with get_db_connection() as conn:
+            if conn is None: return []
+            with conn.cursor() as cur:
+                cur.execute(sql, (role,))
+                return cur.fetchall()
+
+    def get_user_by_id(self, user_id):
+        """Fetches a single user by their ID."""
+        sql = "SELECT user_id, full_name, role, manager_id FROM users WHERE user_id = %s;"
+        with get_db_connection() as conn:
+            if conn is None: return None
+            with conn.cursor() as cur:
+                cur.execute(sql, (user_id,))
+                user = cur.fetchone()
+                if user:
+                    return {"id": user[0], "name": user[1], "role": user[2], "manager_id": user[3]}
+                return None
+
+    def get_goals_for_employee(self, employee_id):
+        """Retrieves all goals for a specific employee."""
+        sql = """
+            SELECT goal_id, description, due_date, status
+            FROM goals
+            WHERE employee_id = %s
+            ORDER BY due_date ASC;
+        """
+        with get_db_connection() as conn:
+            if conn is None: return pd.DataFrame()
+            with conn.cursor() as cur:
+                cur.execute(sql, (employee_id,))
+                goals = cur.fetchall()
+                columns = ['goal_id', 'description', 'due_date', 'status']
+                return pd.DataFrame(goals, columns=columns)
+
+    def get_tasks_for_goal(self, goal_id):
+        """Retrieves all tasks associated with a specific goal."""
+        sql = "SELECT task_id, description, status FROM tasks WHERE goal_id = %s ORDER BY created_at ASC;"
+        with get_db_connection() as conn:
+            if conn is None: return pd.DataFrame()
+            with conn.cursor() as cur:
+                cur.execute(sql, (goal_id,))
+                tasks = cur.fetchall()
+                columns = ['task_id', 'description', 'status']
+                return pd.DataFrame(tasks, columns=columns)
+
+    def get_feedback_for_goal(self, goal_id):
+        """Retrieves all feedback for a specific goal."""
+        sql = "SELECT comment, created_at FROM feedback WHERE goal_id = %s ORDER BY created_at DESC;"
+        with get_db_connection() as conn:
+            if conn is None: return pd.DataFrame()
+            with conn.cursor() as cur:
+                cur.execute(sql, (goal_id,))
+                feedback = cur.fetchall()
+                columns = ['comment', 'created_at']
+                return pd.DataFrame(feedback, columns=columns)
+
+    def get_performance_history(self, employee_id):
+        """
+        Retrieves a comprehensive performance report for an employee.
+        Joins goals, tasks, and feedback for a unified view.
+        """
+        sql = """
+            SELECT
+                g.goal_id,
+                g.description AS goal_description,
+                g.due_date,
+                g.status AS goal_status,
+                t.description AS task_description,
+                t.status AS task_status,
+                f.comment AS feedback_comment,
+                f.created_at AS feedback_date
+            FROM goals g
+            LEFT JOIN tasks t ON g.goal_id = t.goal_id
+            LEFT JOIN feedback f ON g.goal_id = f.goal_id
+            WHERE g.employee_id = %s
+            ORDER BY g.due_date DESC, t.created_at DESC;
+        """
+        with get_db_connection() as conn:
+            if conn is None: return pd.DataFrame()
+            with conn.cursor() as cur:
+                cur.execute(sql, (employee_id,))
+                data = cur.fetchall()
+                columns = ['goal_id', 'goal_description', 'due_date', 'goal_status', 'task_description', 'task_status', 'feedback_comment', 'feedback_date']
+                return pd.DataFrame(data, columns=columns)
+
+    # --- New Function for Analytics Dashboard ---
+    def get_analytics_data(self):
+        """
+        Fetches key performance metrics for the analytics dashboard.
+        """
+        metrics = {}
+        with get_db_connection() as conn:
+            if conn is None: return metrics
+            with conn.cursor() as cur:
+                # Total number of goals
+                cur.execute("SELECT COUNT(*) FROM goals;")
+                metrics['total_goals'] = cur.fetchone()[0]
+
+                # Goals by status
+                cur.execute("SELECT status, COUNT(*) FROM goals GROUP BY status;")
+                metrics['goals_by_status'] = pd.DataFrame(cur.fetchall(), columns=['status', 'count'])
+
+                # Total number of tasks
+                cur.execute("SELECT COUNT(*) FROM tasks;")
+                metrics['total_tasks'] = cur.fetchone()[0]
+
+                # Total number of feedback comments
+                cur.execute("SELECT COUNT(*) FROM feedback;")
+                metrics['total_feedback'] = cur.fetchone()[0]
+                
+        return metrics
+
+    # CREATE Operations
+    def create_goal(self, description, due_date, employee_id, manager_id):
+        """
+        Manager can set a new goal for an employee.
+        Atomicity: Inserts the goal and an initial task in a single transaction.
+        """
+        sql = """
+            INSERT INTO goals (description, due_date, status, employee_id, manager_id)
+            VALUES (%s, %s, %s, %s, %s) RETURNING goal_id;
+        """
+        initial_task_sql = """
+            INSERT INTO tasks (description, status, goal_id)
+            VALUES (%s, %s, %s);
+        """
+        with get_db_connection() as conn:
+            if conn is None: return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (description, due_date, 'In Progress', employee_id, manager_id))
+                    goal_id = cur.fetchone()[0]
+                    cur.execute(initial_task_sql, ("Acknowledge goal and plan tasks.", "Pending Approval", goal_id))
+                conn.commit()
+                return True
+            except psycopg2.Error as e:
+                conn.rollback()
+                print(f"Error creating goal: {e}")
+                return False
+
+    def create_task(self, description, goal_id):
+        """Employee can create a new task for a goal."""
+        sql = "INSERT INTO tasks (description, status, goal_id) VALUES (%s, %s, %s);"
+        with get_db_connection() as conn:
+            if conn is None: return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (description, 'Pending Approval', goal_id))
+                conn.commit()
+                return True
+            except psycopg2.Error as e:
+                conn.rollback()
+                print(f"Error creating task: {e}")
+                return False
+                
+    def create_feedback(self, comment, goal_id, manager_id, employee_id):
+        """Manager can provide written feedback on a goal."""
+        sql = "INSERT INTO feedback (comment, goal_id, manager_id, employee_id) VALUES (%s, %s, %s, %s);"
+        with get_db_connection() as conn:
+            if conn is None: return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (comment, goal_id, manager_id, employee_id))
+                conn.commit()
+                return True
+            except psycopg2.Error as e:
+                conn.rollback()
+                print(f"Error creating feedback: {e}")
+                return False
+
+    def _create_automated_feedback(self, goal_id, manager_id, employee_id):
+        """
+        Automated feedback is generated when a goal is completed.
+        This simulates a database trigger.
+        """
+        comment = "Automated: This goal has been marked as Completed. Great job!"
+        self.create_feedback(comment, goal_id, manager_id, employee_id)
+
+
+    # UPDATE Operations
+    def update_goal_status(self, goal_id, new_status, manager_id, employee_id):
+        """Manager can update the status of a goal."""
+        sql = "UPDATE goals SET status = %s WHERE goal_id = %s;"
+        with get_db_connection() as conn:
+            if conn is None: return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (new_status, goal_id))
+                conn.commit()
+                # Trigger automated feedback if goal is completed
+                if new_status == 'Completed':
+                    self._create_automated_feedback(goal_id, manager_id, employee_id)
+                return True
+            except psycopg2.Error as e:
+                conn.rollback()
+                print(f"Error updating goal status: {e}")
+                return False
+    
+    def update_task_status(self, task_id, new_status):
+        """User can update a task's status."""
+        sql = "UPDATE tasks SET status = %s WHERE task_id = %s;"
+        with get_db_connection() as conn:
+            if conn is None: return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (new_status, task_id))
+                conn.commit()
+                return True
+            except psycopg2.Error as e:
+                conn.rollback()
+                print(f"Error updating task status: {e}")
+                return False
+
+    # DELETE Operations (Soft Delete)
+    # Note: For simplicity, a delete operation is not exposed in the frontend.
+    # We use 'Cancelled' status instead of hard deletes.
+
+
+
+--------Fronted--------
+# frontend_pms.py
+
+import streamlit as st
+import pandas as pd
+from Backened import PMSBackend
+
+# --- App Initialization ---
+st.set_page_config(layout="wide", page_title="Simple PMS")
+
+# Initialize the backend
+backend = PMSBackend()
+
+# --- User Authentication (for Demo) ---
+if 'current_user' not in st.session_state:
+    st.session_state.current_user = None
+
+if not st.session_state.current_user:
+    st.title("👤 Login to Performance Management System")
+    try:
+        user_role_options = {
+            "Manager": backend.get_users_by_role('Manager'),
+            "Employee": backend.get_users_by_role('Employee')
+        }
+        
+        role = st.selectbox("Select Your Role", list(user_role_options.keys()))
+        
+        # Add a check to prevent the TypeError
+        users_in_role = user_role_options.get(role, [])
+        if not users_in_role:
+            st.warning(f"No {role} users found in the database. Please check your database connection or sample data.")
+        
+        user_options = {user[1]: user[0] for user in users_in_role}
+        selected_user_name = st.selectbox("Select Your Name", list(user_options.keys()))
+
+        if st.button("Log In"):
+            user_id = user_options[selected_user_name]
+            user_data = backend.get_user_by_id(user_id)
+            if user_data:
+                st.session_state.current_user = user_data
+                st.rerun()
+            else:
+                st.error("Failed to log in. User not found.")
+
+    except Exception as e:
+        st.error(f"An error occurred during login. Please ensure your database is running and the credentials in backend_pms.py are correct.")
+        st.error(f"Error details: {e}")
+
+else:
+    # --- Main App Interface ---
+    st.title(f"Welcome, {st.session_state.current_user['name']}!")
+    
+    # Create tabs for different functionalities
+    tabs = st.tabs(["🎯 Goals & Tasks", "🗣️ Feedback", "📈 Reporting", "📊 Analytics Dashboard"])
+
+    # 1. Goal Setting & Progress Tracking
+    with tabs[0]:
+        st.header("Goals and Tasks")
+        if st.session_state.current_user['role'] == 'Manager':
+            st.subheader("Set a New Goal")
+            
+            employees = backend.get_users_by_role('Employee')
+            employee_map = {emp[1]: emp[0] for emp in employees}
+            
+            with st.form("new_goal_form"):
+                selected_employee = st.selectbox("Select an Employee", list(employee_map.keys()))
+                goal_description = st.text_area("Goal Description", max_chars=500)
+                due_date = st.date_input("Due Date")
+                
+                submitted = st.form_submit_button("Set Goal")
+                if submitted and goal_description:
+                    employee_id = employee_map[selected_employee]
+                    success = backend.create_goal(
+                        goal_description, due_date, employee_id, st.session_state.current_user['id']
+                    )
+                    if success:
+                        st.success(f"Goal for {selected_employee} has been set!")
+                    else:
+                        st.error("Failed to set goal. Please check database connection.")
+
+            st.divider()
+            
+            st.subheader("Team Goals")
+            team_goals = backend.get_performance_history(st.session_state.current_user['id'])
+            if not team_goals.empty:
+                st.dataframe(team_goals, use_container_width=True)
+            else:
+                st.info("No goals found for your team.")
+
+        else: # Employee
+            st.subheader("Your Goals & Tasks")
+            employee_goals = backend.get_goals_for_employee(st.session_state.current_user['id'])
+            
+            if not employee_goals.empty:
+                for index, goal in employee_goals.iterrows():
+                    with st.expander(f"**Goal:** {goal['description']} (Due: {goal['due_date']}) - Status: {goal['status']}"):
+                        st.write("### Tasks")
+                        goal_tasks = backend.get_tasks_for_goal(goal['goal_id'])
+                        if not goal_tasks.empty:
+                            st.dataframe(goal_tasks, use_container_width=True)
+                        else:
+                            st.info("No tasks logged yet.")
+                        
+                        with st.form(f"task_form_{goal['goal_id']}"):
+                            new_task_desc = st.text_area("Log a new task:", key=f"task_desc_{goal['goal_id']}")
+                            if st.form_submit_button("Add Task"):
+                                success = backend.create_task(new_task_desc, goal['goal_id'])
+                                if success:
+                                    st.success("Task added for manager approval.")
+                                else:
+                                    st.error("Failed to add task.")
+                                st.rerun()
+            else:
+                st.info("You currently have no goals assigned.")
+    
+    # 2. Feedback Section
+    with tabs[1]:
+        st.header("Feedback")
+        if st.session_state.current_user['role'] == 'Manager':
+            st.subheader("Provide Feedback")
+            
+            employees = backend.get_users_by_role('Employee')
+            employee_map = {emp[1]: emp[0] for emp in employees}
+            
+            with st.form("feedback_form"):
+                selected_employee = st.selectbox("Select an Employee", list(employee_map.keys()))
+                employee_id = employee_map[selected_employee]
+                
+                employee_goals = backend.get_goals_for_employee(employee_id)
+                goal_map = {f"{g['description']} (Due: {g['due_date']})": g['goal_id'] for _, g in employee_goals.iterrows()}
+
+                selected_goal_name = st.selectbox("Select a Goal", list(goal_map.keys()))
+                feedback_comment = st.text_area("Your Feedback")
+                
+                if st.form_submit_button("Submit Feedback"):
+                    goal_id = goal_map[selected_goal_name]
+                    success = backend.create_feedback(
+                        feedback_comment, goal_id, st.session_state.current_user['id'], employee_id
+                    )
+                    if success:
+                        st.success("Feedback submitted!")
+                    else:
+                        st.error("Failed to submit feedback.")
+                    st.rerun()
+
+        else: # Employee
+            st.subheader("Your Feedback")
+            goals = backend.get_goals_for_employee(st.session_state.current_user['id'])
+            
+            if not goals.empty:
+                for _, goal in goals.iterrows():
+                    with st.expander(f"**Feedback for:** {goal['description']}"):
+                        feedback_df = backend.get_feedback_for_goal(goal['goal_id'])
+                        if not feedback_df.empty:
+                            st.dataframe(feedback_df, use_container_width=True)
+                        else:
+                            st.info("No feedback yet.")
+            else:
+                st.info("You have no goals, so there is no feedback to display.")
+    
+    # 3. Reporting Section
+    with tabs[2]:
+        st.header("Performance Reports")
+        if st.session_state.current_user['role'] == 'Manager':
+            employees = backend.get_users_by_role('Employee')
+            employee_map = {emp[1]: emp[0] for emp in employees}
+            
+            selected_report_employee = st.selectbox("Select an Employee to view report", list(employee_map.keys()))
+            employee_id = employee_map[selected_report_employee]
+            
+            report_df = backend.get_performance_history(employee_id)
+            
+            if not report_df.empty:
+                st.subheader(f"Performance History for {selected_report_employee}")
+                st.dataframe(report_df, use_container_width=True)
+            else:
+                st.info("No performance data found for this employee.")
+
+        else: # Employee
+            st.subheader("Your Performance Report")
+            report_df = backend.get_performance_history(st.session_state.current_user['id'])
+            if not report_df.empty:
+                st.dataframe(report_df, use_container_width=True)
+            else:
+                st.info("No performance data found for you.")
+
+    # 4. Analytics Dashboard
+    with tabs[3]:
+        st.header("📊 Analytics Dashboard")
+        if st.session_state.current_user['role'] == 'Manager':
+            analytics_data = backend.get_analytics_data()
+
+            st.subheader("Key Performance Indicators")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Goals", analytics_data['total_goals'])
+            with col2:
+                st.metric("Total Tasks", analytics_data['total_tasks'])
+            with col3:
+                st.metric("Total Feedback", analytics_data['total_feedback'])
+
+            st.divider()
+
+            st.subheader("Goal Status Breakdown")
+            goals_by_status = analytics_data['goals_by_status']
+            if not goals_by_status.empty:
+                st.dataframe(goals_by_status, use_container_width=True)
+                st.bar_chart(goals_by_status.set_index('status'))
+            else:
+                st.info("No goals to display in the chart.")
+        else:
+            st.warning("You do not have permission to view the Analytics Dashboard.")
+
+    # Log out button
+    if st.sidebar.button("Log Out"):
+        st.session_state.current_user = None
+        st.rerun()
